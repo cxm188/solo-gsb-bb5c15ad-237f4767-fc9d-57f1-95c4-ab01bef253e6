@@ -121,6 +121,8 @@ def create_app(settings: Settings) -> FastAPI:
         - 每桶返回五个 canonical severity 各自计数、事件总数与桶内事件
           **当前**涉及的不同 segment_id 数；无事件桶同样输出，末桶可短于桶宽；
         - 桶按时间**升序**输出；接口纯读（query_only 连接），不改写任何表；
+        - 桶数、响应边界与事件归桶统一按整数微秒宽度计算，
+          ``bucket_seconds`` 无法精确表示为整数微秒时返回 422；
         - ``start_at`` 不晚于 ``end_at``、时间窗口非空、桶数不超过
           10000，否则返回 422。
         """
@@ -290,8 +292,8 @@ def create_app(settings: Settings) -> FastAPI:
         - ``bucket_seconds`` 必填：时长桶从 0 起等宽划分（左闭右开），
           覆盖到最长时长所在的桶，空桶同样输出，桶按时长升序稳定输出；
         - 全部读取在同一 query_only 只读快照内完成，不改写任何表；
-          ``start_at`` 晚于 ``end_at``、桶长非正/非数字或桶数超过
-          10000 时返回 422。
+          ``start_at`` 晚于 ``end_at``、桶长非正/非数字/无法精确表示为
+          整数微秒或桶数超过 10000 时返回 422。
         """
         if start_at is not None and start_at.tzinfo is None:
             start_at = start_at.replace(tzinfo=timezone.utc)

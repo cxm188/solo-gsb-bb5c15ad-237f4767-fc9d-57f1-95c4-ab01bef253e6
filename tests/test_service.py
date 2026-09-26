@@ -1173,6 +1173,37 @@ class ServiceTestCase(unittest.TestCase):
             r["buckets"][-1]["bucket_end"], "1970-01-01T00:00:00.300000+00:00"
         )
 
+    def test_metrics_non_integer_microsecond_width_rejected(self):
+        # 1.5µs / 0.9µs 无法精确表示为整数微秒 → 拒绝，不静默取整
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 1.0, 0.0000015)
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 1.0, 0.0000009)
+        # 恰好 1µs / 2µs 为合法桶宽
+        self.assertEqual(len(self.metrics("s1", 0.0, 0.000004, 0.000001)["buckets"]), 4)
+        self.assertEqual(len(self.metrics("s1", 0.0, 0.000004, 0.000002)["buckets"]), 2)
+
+    def test_metrics_microsecond_width_boundaries_match_bucketing(self):
+        # 整数微秒桶宽：响应边界与归桶口径一致，事件不落在标示区间之外
+        self.submit("s1", "e1", 0.000001)  # 1µs → 桶 [0, 2µs)
+        self.submit("s1", "e2", 0.000003)  # 3µs → 桶 [2µs, 4µs)
+        r = self.metrics("s1", 0.0, 0.000005, 0.000002)
+        buckets = r["buckets"]
+        self.assertEqual(len(buckets), 3)  # 5µs / 2µs 向上取整，末桶截到 5µs
+        self.assertEqual(
+            [(b["bucket_start"], b["bucket_end"]) for b in buckets],
+            [
+                ("1970-01-01T00:00:00+00:00",
+                 "1970-01-01T00:00:00.000002+00:00"),
+                ("1970-01-01T00:00:00.000002+00:00",
+                 "1970-01-01T00:00:00.000004+00:00"),
+                ("1970-01-01T00:00:00.000004+00:00",
+                 "1970-01-01T00:00:00.000005+00:00"),  # 末桶截断到 end_at
+            ],
+        )
+        self.assertEqual([b["event_count"] for b in buckets], [1, 1, 0])
+        self.assertEqual(r["bucket_seconds"], 0.000002)
+
     def test_metrics_rejects_invalid_range_and_width(self):
         with self.assertRaises(ValueError):
             self.metrics("s1", 10.0, 10.0, 10.0)  # end == start：空窗口
@@ -2041,6 +2072,8 @@ class SegmentDurationReportTestCase(unittest.TestCase):
                 self.report(bucket_seconds=bad)
         with self.assertRaises(ValueError):
             self.report(bucket_seconds=1e-7)  # 不足 1 微秒
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=0.0000015)  # 非整数微秒（1.5µs）
 
     def test_bucket_count_capped(self):
         # 链式事件构成时长 100s 的单段：100/0.01 → 10001 桶拒绝，9901 桶允许

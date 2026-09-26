@@ -148,16 +148,17 @@ curl 'http://localhost:8000/events/metrics?source=edge-gateway-01&start_at=2026-
 | `source` | 是 | 只统计该来源的事件（1–256 字符） |
 | `start_at` | 是 | 窗口下界（**含边界**），ISO 8601；无时区按 UTC 处理；必须早于 `end_at` |
 | `end_at` | 是 | 窗口上界（**不含边界**），ISO 8601；无时区按 UTC 处理 |
-| `bucket_seconds` | 是 | 桶宽（秒，**正数**，支持小数，如 `0.5`）；桶从 `start_at` 等宽对齐 |
+| `bucket_seconds` | 是 | 桶宽（秒，**正数**，支持小数，如 `0.5`）；**必须能精确表示为整数微秒**（最小 `0.000001`，如 `0.5`、`0.000002` 合法，`0.0000015` 这类非整数微秒值返回 `422`）；桶从 `start_at` 等宽对齐 |
 
 - **左闭右开**：窗口为 `[start_at, end_at)`，恰好等于 `end_at` 的事件不统计；桶为 `[bucket_start, bucket_end)`，恰好等于桶边界的事件落入下一个桶。
+- **整数微秒桶宽**：桶数、响应中的桶边界与事件归桶统一按同一个整数微秒宽度计算（`occurred_at` 的存储精度），三者不会错位；`bucket_seconds` 无法精确表示为整数微秒时返回 `422`，不做静默取整。
 - **`severity_counts`** 固定包含五个 canonical 键 `debug`/`info`/`warning`/`error`/`critical`，缺省为 0（`warn`/`fatal` 等别名按归一化后的 canonical 级别计数）；`event_count` 等于五项之和。
 - **`distinct_segment_count`** 为桶内事件**当前**涉及的不同 segment_id 数——与 `GET /events` 一样反映查询快照中的实时归属，迟到合并、误报撤回拆段会改变该值。
 - **无事件桶覆盖**：整个 `[start_at, end_at)` 范围被桶完全覆盖（末桶截断到 `end_at`），没有事件的桶也按时间序输出零计数；未知 source 返回同样的全零桶序列。
 - **UTC 边界**：带时区偏移的入参（如 `2026-09-20T16:00:00+08:00`）先换算到 UTC 再对齐桶边界，响应中的时间均为 UTC。
 - **桶数上限 10000**：`ceil((end_at - start_at) / bucket_seconds)` 超过 10000 时返回 `422`，防止极大窗口/极小桶长导致输出无界。
 - **快照一致性与纯读**：统计在同一只读事务快照内完成，请求期间的并发写入不影响本次结果，不会改写事件、段或变更流。
-- 参数校验失败（缺任一必填参数、空 `source`、`bucket_seconds <= 0` 或非数字、非法时间、`start_at >= end_at`、桶数超上限）统一返回 `422`。
+- 参数校验失败（缺任一必填参数、空 `source`、`bucket_seconds <= 0` 或非数字、桶长无法精确表示为整数微秒、非法时间、`start_at >= end_at`、桶数超上限）统一返回 `422`。
 
 ### 查询事件段详情 `GET /segments/{id}`
 
@@ -525,14 +526,14 @@ curl 'http://localhost:8000/segments/duration-report?source=edge-gateway-01&star
 | `source` | 否 | 不过滤（统计全部来源） | 精确匹配该来源的段（1–256 字符） |
 | `start_at` | 否 | 不限制 | 时间窗下界（**含边界**，闭区间），ISO 8601；无时区按 UTC 处理；不得晚于 `end_at` |
 | `end_at` | 否 | 不限制 | 时间窗上界（**含边界**，闭区间），ISO 8601；无时区按 UTC 处理 |
-| `bucket_seconds` | 是 | — | 时长桶宽（秒，**正数**，支持小数，最小粒度 1 微秒） |
+| `bucket_seconds` | 是 | — | 时长桶宽（秒，**正数**，支持小数）；**必须能精确表示为整数微秒**（最小 `0.000001`），否则返回 `422` |
 
 - **样本与时长**：样本为筛选后的**当前**事件段（撤回/合并重算后的实时状态），每段时长 = `ended_at - started_at`（秒，微秒精度）；单事件段时长为 0。
 - **统计量**：`min_seconds` / `max_seconds` / `mean_seconds` / `median_seconds` / `p90_seconds`；分位数采用**线性插值**（与 numpy 默认方法一致），均值与分位数取整到微秒。**无匹配段时** `sample_count` 为 0，各统计量为 `null`，`buckets` 为空列表。
 - **时长桶**：从 0 起按 `bucket_seconds` 等宽划分（`[bucket_start_seconds, bucket_end_seconds)` 左闭右开，恰好等于桶边界的时长落入右侧桶），覆盖到最长时长所在的桶；**空桶同样输出**（`segment_count` 为 0），桶按时长**升序**稳定输出；所有桶的 `segment_count` 之和等于 `sample_count`。
 - **桶数上限 10000**：`floor(最长时长 / bucket_seconds) + 1` 超过 10000 时返回 `422`，防止极小桶长/极大时长导致输出无界。
 - **快照一致性与纯读**：全部读取在同一只读事务快照内完成，请求期间的并发写入不影响本次结果，不会改写事件、段或变更流；相同入参的重复请求结果确定一致。
-- 参数校验失败（缺 `bucket_seconds`、桶长非正/非数字/不足 1 微秒、非法时间、`start_at > end_at`、空 `source`、桶数超上限）统一返回 `422`。
+- 参数校验失败（缺 `bucket_seconds`、桶长非正/非数字/无法精确表示为整数微秒、非法时间、`start_at > end_at`、空 `source`、桶数超上限）统一返回 `422`。
 
 ### 配置告警升级策略 `PUT /escalation-policies/{source}`
 

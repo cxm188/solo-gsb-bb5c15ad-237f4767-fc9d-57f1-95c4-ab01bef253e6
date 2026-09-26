@@ -914,6 +914,32 @@ def test_metrics_param_validation(client):
     ).status_code == 422
 
 
+def test_metrics_non_integer_microsecond_bucket_rejected(client):
+    # 1.5µs 无法精确表示为整数微秒 → 422（不再静默按 2µs 归桶）
+    base = {
+        "source": "gw-01",
+        "start_at": "2026-09-20T08:00:00Z",
+        "end_at": "2026-09-20T08:00:00.000010Z",
+    }
+    assert _metrics(client, **base, bucket_seconds=0.0000015).status_code == 422
+    # 恰好 2µs 合法：桶数、响应边界与归桶统一按 2µs 整数微秒宽度
+    resp = _metrics(client, **base, bucket_seconds=0.000002)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["bucket_seconds"] == 0.000002
+    buckets = body["buckets"]
+    assert len(buckets) == 5
+    assert [b["bucket_start"].replace("Z", "+00:00") for b in buckets] == [
+        "2026-09-20T08:00:00+00:00",
+        "2026-09-20T08:00:00.000002+00:00",
+        "2026-09-20T08:00:00.000004+00:00",
+        "2026-09-20T08:00:00.000006+00:00",
+        "2026-09-20T08:00:00.000008+00:00",
+    ]
+    assert (buckets[-1]["bucket_end"].replace("Z", "+00:00")
+            == "2026-09-20T08:00:00.000010+00:00")  # 末桶截断到 end_at
+
+
 def test_metrics_bucket_count_at_limit_allowed(client):
     # 恰好 10000 个桶允许
     resp = _metrics(
@@ -1877,11 +1903,12 @@ def test_duration_report_timezone_offsets_normalized_to_utc(client):
 def test_duration_report_param_validation(client):
     # 缺 bucket_seconds
     assert client.get("/segments/duration-report").status_code == 422
-    # 桶长为 0 / 负数 / 非数字 / 不足 1 微秒
+    # 桶长为 0 / 负数 / 非数字 / 不足 1 微秒 / 非整数微秒
     assert _duration_report(client, bucket_seconds=0).status_code == 422
     assert _duration_report(client, bucket_seconds=-5).status_code == 422
     assert _duration_report(client, bucket_seconds="soon").status_code == 422
     assert _duration_report(client, bucket_seconds=0.0000001).status_code == 422
+    assert _duration_report(client, bucket_seconds=0.0000015).status_code == 422
     # 空 source
     assert _duration_report(
         client, source="", bucket_seconds=60

@@ -38,7 +38,10 @@
 - 在调用方提供的同一只读快照内读取 [start_ts, end_ts) 左闭右开窗口内
   指定 source 的事件，按 occurred_at 划入等宽时间桶（左闭右开，桶边界
   对齐 start_ts），返回每桶各 canonical severity 计数、事件总数及涉及的
-  不同 segment_id 数；无事件桶同样输出（计数为 0），末桶可短于桶宽；
+  不同 segment_id 数；无事件桶同样输出（计数为 0），末桶截断到 end_ts；
+- 桶宽必须能精确表示为整数微秒：桶数、响应边界与事件归桶统一使用该
+  整数微秒宽度，三者不会错位；无法精确表示的桶长（如 1.5 微秒）抛
+  ValueError（调用方回 422），不做静默取整；
 - 非法时间范围（end <= start）、非正/非有限桶长或桶数超过上限抛
   ValueError（调用方回 422）；仅执行 SELECT，不改写任何表。
 
@@ -60,8 +63,8 @@
 - 返回样本数、最短/最长、均值、中位数与 P90（线性插值分位数），并按
   bucket_seconds 生成从 0 起的等宽左闭右开时长桶（空桶同样输出，桶按
   时长升序稳定输出）；无匹配段时各统计量为 None、桶列表为空；
-- 非法时间范围、非正/非有限桶长或桶数超过上限抛 ValueError（调用方回 422）；
-  仅执行 SELECT，不改写任何表。
+- 非法时间范围、非正/非有限桶长、无法精确表示为整数微秒的桶长或桶数
+  超过上限抛 ValueError（调用方回 422）；仅执行 SELECT，不改写任何表。
 
 变更水位历史快照（get_segment_snapshot，纯读）：
 - 在调用方提供的同一只读事务内，以 segment_changes 为唯一事实来源重建
@@ -117,8 +120,12 @@ from datetime import datetime, timedelta, timezone
 from . import severity as sev
 
 
+def _iso_dt(dt: datetime) -> str:
+    return dt.isoformat()
+
+
 def _iso(ts: float) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    return _iso_dt(datetime.fromtimestamp(ts, tz=timezone.utc))
 
 
 def _row_to_segment(row: sqlite3.Row) -> dict:
@@ -251,6 +258,33 @@ def list_events(
 MAX_METRIC_BUCKETS = 10_000
 
 
+def _bucket_width_us(bucket_seconds: float) -> int:
+    """把桶宽（秒）规范化为整数微秒宽度；无法精确表示时抛 ValueError（调用方回 422）。
+
+    桶数、响应边界与事件归桶统一使用返回的整数微秒宽度，三者绝不因浮点
+    换算而错位；无法精确表示为整数微秒的桶长（如 1.5 微秒）一律拒绝，
+    不做静默取整。判定采用往返比较：bucket_seconds 必须恰好等于某个
+    整数微秒数换算回的秒值（0.1 之类的合法小数因浮点表示误差在换算
+    往返后仍与原值相等，不受影响）。
+    """
+    if (
+        not isinstance(bucket_seconds, (int, float))
+        or isinstance(bucket_seconds, bool)
+        or not math.isfinite(bucket_seconds)
+        or bucket_seconds <= 0
+    ):
+        raise ValueError("bucket_seconds 必须为正数")
+    product = bucket_seconds * 1_000_000
+    if not math.isfinite(product):  # 防御：极大桶长换算溢出
+        raise ValueError("bucket_seconds 必须能精确表示为整数微秒")
+    width_us = int(round(product))
+    if width_us <= 0:
+        raise ValueError("bucket_seconds 过小（最小粒度为 1 微秒）")
+    if bucket_seconds != width_us / 1_000_000:
+        raise ValueError("bucket_seconds 必须能精确表示为整数微秒")
+    return width_us
+
+
 def event_metrics(
     conn: sqlite3.Connection,
     *,
@@ -262,14 +296,15 @@ def event_metrics(
     """事件审计时间桶统计（纯读）：等宽左闭右开桶内的级别计数/总数/不同段数。
 
     - 查询窗口为 [start_ts, end_ts)（左闭右开，epoch 秒），仅统计该 source；
-    - 桶从 start_ts 起按 bucket_seconds 等宽划分，末桶可短于桶宽；
-      无事件桶同样输出，severity_counts 固定包含五个 canonical 级别键；
+    - 桶从 start_ts 起按 bucket_seconds 等宽划分，末桶可短于桶宽（截断到
+      end_ts）；无事件桶同样输出，severity_counts 固定包含五个 canonical 级别键；
     - distinct_segment_count 按查询快照中事件的当前 segment_id 实时归属统计；
-    - end_ts <= start_ts、bucket_seconds 非正/非有限或桶数超过
-      MAX_METRIC_BUCKETS 时抛 ValueError（调用方回 422）。
+    - end_ts <= start_ts、bucket_seconds 非正/非有限、无法精确表示为整数
+      微秒或桶数超过 MAX_METRIC_BUCKETS 时抛 ValueError（调用方回 422）。
 
-    桶序号一律以整数微秒（occurred_at 的存储精度）相对 start_ts 的跨度计算，
-    避免大 epoch 基值上浮点除法把恰好落在桶边界的事件划入前一桶。
+    桶数、响应边界与事件归桶统一使用同一个整数微秒宽度（occurred_at 的
+    存储精度）：桶序号以整数微秒跨度计算，响应边界也按整数微秒偏移生成，
+    避免大 epoch 基值上浮点运算让事件落入其标示区间之外。
 
     调用方应使用 read_only_session：本函数只执行 SELECT，在同一快照内完成统计。
     """
@@ -277,18 +312,12 @@ def event_metrics(
         raise ValueError("非法时间范围")
     if end_ts <= start_ts:
         raise ValueError("时间范围为空：end_at 必须晚于 start_at")
-    if not isinstance(bucket_seconds, (int, float)) or isinstance(
-        bucket_seconds, bool
-    ) or not math.isfinite(bucket_seconds) or bucket_seconds <= 0:
-        raise ValueError("bucket_seconds 必须为正数")
+    width_us = _bucket_width_us(bucket_seconds)
 
     # 用整数微秒跨度算桶数与桶位，避免浮点除法 ceil 在整倍数边界多算一个桶
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
     span_us = (end_dt - start_dt) // timedelta(microseconds=1)
-    width_us = int(round(bucket_seconds * 1_000_000))
-    if width_us <= 0:
-        raise ValueError("bucket_seconds 过小（最小粒度为 1 微秒）")
     bucket_count = (span_us + width_us - 1) // width_us
     if bucket_count > MAX_METRIC_BUCKETS:
         raise ValueError(
@@ -301,10 +330,14 @@ def event_metrics(
         ) // timedelta(microseconds=1)
         return max(delta_us // width_us, 0)
 
+    # 响应边界同样按整数微秒偏移生成（与归桶口径一致），末桶截断到 end_at；
+    # 偏移量以 span_us 为上界先取 min 再换算，避免极端桶宽下 timedelta 溢出
     buckets: list[dict] = [
         {
-            "bucket_start": _iso(start_ts + i * bucket_seconds),
-            "bucket_end": _iso(min(start_ts + (i + 1) * bucket_seconds, end_ts)),
+            "bucket_start": _iso_dt(start_dt + timedelta(microseconds=i * width_us)),
+            "bucket_end": _iso_dt(
+                start_dt + timedelta(microseconds=min((i + 1) * width_us, span_us))
+            ),
             "severity_counts": {level: 0 for level in sev.LEVELS},
             "event_count": 0,
             "distinct_segment_count": 0,
@@ -532,8 +565,8 @@ def segment_duration_report(
     - 时长桶从 0 起按 bucket_seconds 等宽划分（左闭右开，恰好等于桶
       边界的时长落入右侧桶），覆盖到最长时长所在的桶；无段落入的空桶
       同样输出，桶按时长升序稳定输出；
-    - start_ts > end_ts、bucket_seconds 非正/非有限、桶宽不足 1 微秒
-      或桶数超过 MAX_DURATION_BUCKETS 时抛 ValueError（调用方回 422）。
+    - start_ts > end_ts、bucket_seconds 非正/非有限、无法精确表示为整数
+      微秒或桶数超过 MAX_DURATION_BUCKETS 时抛 ValueError（调用方回 422）。
 
     调用方应使用 read_only_session：本函数只执行 SELECT，在同一快照内
     完成全部读取与统计，不改写任何表。
@@ -544,17 +577,9 @@ def segment_duration_report(
         raise ValueError("非法时间范围")
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         raise ValueError("start_at 不能晚于 end_at")
-    if (
-        not isinstance(bucket_seconds, (int, float))
-        or isinstance(bucket_seconds, bool)
-        or not math.isfinite(bucket_seconds)
-        or bucket_seconds <= 0
-    ):
-        raise ValueError("bucket_seconds 必须为正数")
-    # 与 event_metrics 相同：桶宽换算为整数微秒，规避浮点除法边界误差
-    width_us = int(round(bucket_seconds * 1_000_000))
-    if width_us <= 0:
-        raise ValueError("bucket_seconds 过小（最小粒度为 1 微秒）")
+    # 与 event_metrics 相同：桶宽统一换算为整数微秒，无法精确表示时拒绝，
+    # 规避浮点除法边界误差与静默取整造成的口径错位
+    width_us = _bucket_width_us(bucket_seconds)
 
     clauses: list[str] = []
     params: list = []
