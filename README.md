@@ -110,7 +110,7 @@ curl 'http://localhost:8000/events?source=edge-gateway-01&start_at=2026-09-20T00
 
 ### 事件审计时间桶统计 `GET /events/metrics`
 
-对已入库事件做**只读聚合统计**。整个请求在**单一只读快照事务**（`query_only` 连接）内完成：按 `occurred_at` 把 `[start_at, end_at)`（**左闭右开**，`end_at` 不含）窗口内指定 `source` 的事件划入从 `start_at` 起等宽（`bucket_seconds`）对齐的时间桶（同样左闭右开），返回每桶各 severity 计数、事件总数与涉及的**不同 segment_id 数**。桶边界统一按 **UTC** 处理，桶按时间**升序**输出，**无事件桶照常返回**（各计数为 0），末个桶可短于桶宽。
+对已入库事件做**只读聚合统计**。整个请求在**单一只读快照事务**（`query_only` 连接）内完成：按 `occurred_at` 把 `[start_at, end_at)`（**左闭右开**，`end_at` 不含）窗口内指定 `source` 的事件划入从 `start_at` 起等宽（`bucket_seconds`）对齐的时间桶（同样左闭右开），返回每桶各 severity 计数、事件总数与涉及的**不同 segment_id 数**。桶边界统一按 **UTC** 处理，桶按时间**升序**输出，**无事件桶照常返回**（各计数为 0），末个桶截断到 `end_at`（可短于桶宽）。桶数、响应中的桶边界与事件归桶统一按**同一个整数微秒桶宽**计算（`occurred_at` 的存储精度为微秒）。
 
 ```bash
 curl 'http://localhost:8000/events/metrics?source=edge-gateway-01&start_at=2026-09-20T08:00:00Z&end_at=2026-09-20T08:04:00Z&bucket_seconds=60'
@@ -148,16 +148,17 @@ curl 'http://localhost:8000/events/metrics?source=edge-gateway-01&start_at=2026-
 | `source` | 是 | 只统计该来源的事件（1–256 字符） |
 | `start_at` | 是 | 窗口下界（**含边界**），ISO 8601；无时区按 UTC 处理；必须早于 `end_at` |
 | `end_at` | 是 | 窗口上界（**不含边界**），ISO 8601；无时区按 UTC 处理 |
-| `bucket_seconds` | 是 | 桶宽（秒，**正数**，支持小数，如 `0.5`）；桶从 `start_at` 等宽对齐 |
+| `bucket_seconds` | 是 | 桶宽（秒，**正数**，支持小数，最小粒度 **1 微秒**，如 `0.5`、`0.0001`、`0.000001`）；必须可精确表示为整数微秒，桶从 `start_at` 等宽对齐 |
 
 - **左闭右开**：窗口为 `[start_at, end_at)`，恰好等于 `end_at` 的事件不统计；桶为 `[bucket_start, bucket_end)`，恰好等于桶边界的事件落入下一个桶。
+- **桶长必须为整数微秒**：服务内部以**整数微秒**（事件时间的存储精度）作为统一桶宽，桶数、响应里的 `bucket_start`/`bucket_end` 与每个事件的归桶都用同一个宽度。因此 `bucket_seconds` 换算为微秒后必须恰好是整数：`0.1`（=100000 微秒）、`0.5`、`60` 等合法；无法精确表示为整数微秒的桶长（如 `0.0000015` 秒 = 1.5 微秒）无法在不造成"归桶宽度与标示边界错配"的前提下实现，返回 `422`；不足 1 微秒（如 `0.0000005`）同样返回 `422`。响应中的 `bucket_seconds` 回显实际生效的微秒桶宽（`width_us / 1_000_000`）。
 - **`severity_counts`** 固定包含五个 canonical 键 `debug`/`info`/`warning`/`error`/`critical`，缺省为 0（`warn`/`fatal` 等别名按归一化后的 canonical 级别计数）；`event_count` 等于五项之和。
 - **`distinct_segment_count`** 为桶内事件**当前**涉及的不同 segment_id 数——与 `GET /events` 一样反映查询快照中的实时归属，迟到合并、误报撤回拆段会改变该值。
 - **无事件桶覆盖**：整个 `[start_at, end_at)` 范围被桶完全覆盖（末桶截断到 `end_at`），没有事件的桶也按时间序输出零计数；未知 source 返回同样的全零桶序列。
 - **UTC 边界**：带时区偏移的入参（如 `2026-09-20T16:00:00+08:00`）先换算到 UTC 再对齐桶边界，响应中的时间均为 UTC。
 - **桶数上限 10000**：`ceil((end_at - start_at) / bucket_seconds)` 超过 10000 时返回 `422`，防止极大窗口/极小桶长导致输出无界。
 - **快照一致性与纯读**：统计在同一只读事务快照内完成，请求期间的并发写入不影响本次结果，不会改写事件、段或变更流。
-- 参数校验失败（缺任一必填参数、空 `source`、`bucket_seconds <= 0` 或非数字、非法时间、`start_at >= end_at`、桶数超上限）统一返回 `422`。
+- 参数校验失败（缺任一必填参数、空 `source`、`bucket_seconds <= 0` 或非数字、**桶长不足 1 微秒或无法精确表示为整数微秒**、非法时间、`start_at >= end_at`、桶数超上限）统一返回 `422`。
 
 ### 查询事件段详情 `GET /segments/{id}`
 

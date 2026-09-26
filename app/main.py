@@ -119,7 +119,11 @@ def create_app(settings: Settings) -> FastAPI:
           （ISO 8601，无时区按 UTC 处理，``end_at`` 不包含），桶从
           ``start_at`` 起按 ``bucket_seconds`` 等宽划分（边界统一按 UTC）；
         - 每桶返回五个 canonical severity 各自计数、事件总数与桶内事件
-          **当前**涉及的不同 segment_id 数；无事件桶同样输出，末桶可短于桶宽；
+          **当前**涉及的不同 segment_id 数；无事件桶同样输出，末桶截断到
+          ``end_at``；
+        - 桶数、响应桶边界与事件归桶统一按**整数微秒桶宽**计算：
+          ``bucket_seconds`` 必须可精确表示为整数微秒（最小 1 微秒，如
+          ``0.5`` 可以、``0.0000015`` 不可以），否则返回 422；
         - 桶按时间**升序**输出；接口纯读（query_only 连接），不改写任何表；
         - ``start_at`` 不晚于 ``end_at``、时间窗口非空、桶数不超过
           10000，否则返回 422。

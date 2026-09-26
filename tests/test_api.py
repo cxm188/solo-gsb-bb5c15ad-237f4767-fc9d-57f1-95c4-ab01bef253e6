@@ -871,6 +871,57 @@ def test_metrics_float_boundary_aligned(client):
             == "2026-09-20T08:00:00.300000+00:00")
 
 
+def test_metrics_non_integer_microsecond_bucket_rejected(client):
+    # 1.5 微秒无法精确表示为整数微秒：归桶宽度与响应边界无法统一 → 422
+    resp = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:00:01Z",
+        bucket_seconds=0.0000015,
+    )
+    assert resp.status_code == 422
+    # 不足 1 微秒同样 422
+    assert _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:00:01Z",
+        bucket_seconds=0.0000005,
+    ).status_code == 422
+
+
+def test_metrics_microsecond_width_boundaries_match_assignment(client):
+    # 桶宽 2 微秒：桶边界与归桶使用同一整数微秒宽度，事件不越出标示区间
+    _post(client, "gw-01", "a", "2026-09-20T08:00:00.000002Z", "info")
+    _post(client, "gw-01", "b", "2026-09-20T08:00:00.000003Z", "error")
+    _post(client, "gw-01", "c", "2026-09-20T08:00:00.000005Z", "warning")
+    resp = _metrics(
+        client,
+        source="gw-01",
+        start_at="2026-09-20T08:00:00Z",
+        end_at="2026-09-20T08:00:00.000006Z",
+        bucket_seconds=0.000002,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["bucket_seconds"] == 0.000002
+    boundaries = [
+        (b["bucket_start"].replace("Z", "+00:00"),
+         b["bucket_end"].replace("Z", "+00:00"))
+        for b in body["buckets"]
+    ]
+    assert boundaries == [
+        ("2026-09-20T08:00:00+00:00",
+         "2026-09-20T08:00:00.000002+00:00"),
+        ("2026-09-20T08:00:00.000002+00:00",
+         "2026-09-20T08:00:00.000004+00:00"),
+        ("2026-09-20T08:00:00.000004+00:00",
+         "2026-09-20T08:00:00.000006+00:00"),
+    ]
+    assert [b["event_count"] for b in body["buckets"]] == [0, 2, 1]
+
+
 def test_metrics_param_validation(client):
     base = {
         "source": "gw-01",

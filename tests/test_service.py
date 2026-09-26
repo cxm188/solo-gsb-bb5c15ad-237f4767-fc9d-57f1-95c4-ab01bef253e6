@@ -1173,6 +1173,63 @@ class ServiceTestCase(unittest.TestCase):
             r["buckets"][-1]["bucket_end"], "1970-01-01T00:00:00.300000+00:00"
         )
 
+    def test_metrics_rejects_non_integer_microsecond_width(self):
+        # 1.5 微秒无法精确表示为整数微秒：归桶宽度与响应边界无法统一 → 拒绝
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10.0, 0.0000015)
+        # 其它非整数微秒桶长同样拒绝（round 到 1 微秒会静默改变桶宽）
+        for bad in (0.0000011, 0.0000019, 1.0 / 3_000_000, 0.0000007):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.metrics("s1", 0.0, 10.0, bad)
+
+    def test_metrics_rejects_sub_microsecond_width(self):
+        # 不足 1 微秒（即使恰好可表示）也无法以微秒精度归桶
+        with self.assertRaises(ValueError):
+            self.metrics("s1", 0.0, 10.0, 0.0000005)
+
+    def test_metrics_microsecond_width_boundaries_match_assignment(self):
+        # 回归测试：桶宽 2 微秒时，归桶与响应边界必须使用同一整数微秒宽度
+        self.submit("s1", "a", 0.000002, "info")   # 恰在桶边界 → 第二桶
+        self.submit("s1", "b", 0.000003, "error")  # 第二桶 [2us, 4us)
+        self.submit("s1", "c", 0.000005, "warning")  # 末桶 [4us, 6us)
+        r = self.metrics("s1", 0.0, 0.000006, 0.000002)
+        self.assertEqual(r["bucket_seconds"], 0.000002)
+        self.assertEqual(len(r["buckets"]), 3)
+        self.assertEqual(
+            [(b["bucket_start"], b["bucket_end"]) for b in r["buckets"]],
+            [
+                ("1970-01-01T00:00:00+00:00",
+                 "1970-01-01T00:00:00.000002+00:00"),
+                ("1970-01-01T00:00:00.000002+00:00",
+                 "1970-01-01T00:00:00.000004+00:00"),
+                ("1970-01-01T00:00:00.000004+00:00",
+                 "1970-01-01T00:00:00.000006+00:00"),
+            ],
+        )
+        counts = [b["event_count"] for b in r["buckets"]]
+        self.assertEqual(counts, [0, 2, 1])
+        # 每个事件都必须落在其桶标示的 [bucket_start, bucket_end) 区间内
+        self.assertEqual(r["buckets"][1]["severity_counts"]["info"], 1)
+        self.assertEqual(r["buckets"][1]["severity_counts"]["error"], 1)
+        self.assertEqual(r["buckets"][2]["severity_counts"]["warning"], 1)
+
+    def test_metrics_single_microsecond_width_and_last_truncation(self):
+        # 1 微秒是最小合法桶宽；末桶截断到 end_at（0.5 微秒余量不另开桶）
+        self.submit("s1", "a", 0.000000)
+        self.submit("s1", "b", 0.000004)
+        r = self.metrics("s1", 0.0, 0.000005, 0.000001)
+        self.assertEqual(len(r["buckets"]), 5)
+        self.assertEqual(
+            r["buckets"][-1]["bucket_start"],
+            "1970-01-01T00:00:00.000004+00:00",
+        )
+        self.assertEqual(
+            r["buckets"][-1]["bucket_end"],
+            "1970-01-01T00:00:00.000005+00:00",  # 截到 end
+        )
+        self.assertEqual([b["event_count"] for b in r["buckets"]], [1, 0, 0, 0, 1])
+
     def test_metrics_rejects_invalid_range_and_width(self):
         with self.assertRaises(ValueError):
             self.metrics("s1", 10.0, 10.0, 10.0)  # end == start：空窗口

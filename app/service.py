@@ -38,9 +38,13 @@
 - 在调用方提供的同一只读快照内读取 [start_ts, end_ts) 左闭右开窗口内
   指定 source 的事件，按 occurred_at 划入等宽时间桶（左闭右开，桶边界
   对齐 start_ts），返回每桶各 canonical severity 计数、事件总数及涉及的
-  不同 segment_id 数；无事件桶同样输出（计数为 0），末桶可短于桶宽；
-- 非法时间范围（end <= start）、非正/非有限桶长或桶数超过上限抛
-  ValueError（调用方回 422）；仅执行 SELECT，不改写任何表。
+  不同 segment_id 数；无事件桶同样输出（计数为 0），末桶截断到 end_ts；
+- 桶数、响应桶边界与事件归桶统一使用同一个整数微秒桶宽
+  （round(bucket_seconds*1e6)，且要求与原值往返一致）；bucket_seconds
+  无法精确表示为整数微秒（如 0.0000015 秒 = 1.5 微秒）时抛 ValueError
+  （调用方回 422），避免归桶宽度与标示边界错配；
+- 非法时间范围（end <= start）、非正/非有限桶长、桶宽不足 1 微秒或
+  桶数超过上限同样抛 ValueError（调用方回 422）；仅执行 SELECT，不改写任何表。
 
 事件段严重性序列模式指纹（segment_patterns，纯读）：
 - 在调用方提供的同一只读快照内扫描当前事件（可选 source 与
@@ -251,6 +255,38 @@ def list_events(
 MAX_METRIC_BUCKETS = 10_000
 
 
+def _bucket_width_us(bucket_seconds: float) -> int:
+    """把桶长（秒）换算为整数微秒宽度；无法精确表示为整数微秒时抛 ValueError。
+
+    桶数、响应桶边界与事件归桶必须共用同一个整数微秒宽度：若把无法整除
+    1e6 的桶长（如 0.0000015 秒 = 1.5 微秒）四舍五入到微秒（2 微秒）后
+    用于归桶，却仍按原始浮点桶长生成响应边界，事件就会被计入其标示区间
+    之外。因此这类桶长直接拒绝（调用方回 422）。
+
+    判定方式为往返一致性：round(b * 1e6) / 1e6 必须等于 b 本身。对实际
+    使用的微秒整数倍桶长（如 0.1、0.5、60.0），b*1e6 在浮点上恰为整数，
+    往返严格相等，不会误伤；只有 1.5 微秒这类真正不可表示的桶长才被拒绝。
+    """
+    if (
+        not isinstance(bucket_seconds, (int, float))
+        or isinstance(bucket_seconds, bool)
+        or not math.isfinite(bucket_seconds)
+        or bucket_seconds <= 0
+    ):
+        raise ValueError("bucket_seconds 必须为正数")
+    scaled = bucket_seconds * 1_000_000
+    if not math.isfinite(scaled):
+        raise ValueError("bucket_seconds 过大")
+    width_us = int(round(scaled))
+    if width_us <= 0:
+        raise ValueError("bucket_seconds 过小（最小粒度为 1 微秒）")
+    if width_us / 1_000_000 != float(bucket_seconds):
+        raise ValueError(
+            "bucket_seconds 必须可精确表示为整数微秒（最小粒度为 1 微秒）"
+        )
+    return width_us
+
+
 def event_metrics(
     conn: sqlite3.Connection,
     *,
@@ -262,14 +298,16 @@ def event_metrics(
     """事件审计时间桶统计（纯读）：等宽左闭右开桶内的级别计数/总数/不同段数。
 
     - 查询窗口为 [start_ts, end_ts)（左闭右开，epoch 秒），仅统计该 source；
-    - 桶从 start_ts 起按 bucket_seconds 等宽划分，末桶可短于桶宽；
+    - 桶从 start_ts 起按 bucket_seconds 等宽划分，末桶截断到 end_ts；
       无事件桶同样输出，severity_counts 固定包含五个 canonical 级别键；
     - distinct_segment_count 按查询快照中事件的当前 segment_id 实时归属统计；
-    - end_ts <= start_ts、bucket_seconds 非正/非有限或桶数超过
-      MAX_METRIC_BUCKETS 时抛 ValueError（调用方回 422）。
+    - end_ts <= start_ts、bucket_seconds 非正/非有限、无法精确表示为整数
+      微秒或桶数超过 MAX_METRIC_BUCKETS 时抛 ValueError（调用方回 422）。
 
-    桶序号一律以整数微秒（occurred_at 的存储精度）相对 start_ts 的跨度计算，
-    避免大 epoch 基值上浮点除法把恰好落在桶边界的事件划入前一桶。
+    桶数、响应桶边界与事件归桶一律以同一个整数微秒宽度（occurred_at 的
+    存储精度）相对 start_ts 的跨度计算，避免大 epoch 基值上浮点除法把恰好
+    落在桶边界的事件划入前一桶，也杜绝"按微秒取整归桶、却按原始浮点桶长
+    标注边界"造成的区间错配。
 
     调用方应使用 read_only_session：本函数只执行 SELECT，在同一快照内完成统计。
     """
@@ -277,18 +315,14 @@ def event_metrics(
         raise ValueError("非法时间范围")
     if end_ts <= start_ts:
         raise ValueError("时间范围为空：end_at 必须晚于 start_at")
-    if not isinstance(bucket_seconds, (int, float)) or isinstance(
-        bucket_seconds, bool
-    ) or not math.isfinite(bucket_seconds) or bucket_seconds <= 0:
-        raise ValueError("bucket_seconds 必须为正数")
+    # 统一的整数微秒桶宽：桶数、响应边界、事件归桶共用，拒绝不可整除 1e6
+    # 的桶长（如 0.0000015 秒），避免归桶宽度与标示边界错配
+    width_us = _bucket_width_us(bucket_seconds)
 
-    # 用整数微秒跨度算桶数与桶位，避免浮点除法 ceil 在整倍数边界多算一个桶
+    # 用整数微秒跨度算桶数，避免浮点除法 ceil 在整倍数边界多算一个桶
     start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
     span_us = (end_dt - start_dt) // timedelta(microseconds=1)
-    width_us = int(round(bucket_seconds * 1_000_000))
-    if width_us <= 0:
-        raise ValueError("bucket_seconds 过小（最小粒度为 1 微秒）")
     bucket_count = (span_us + width_us - 1) // width_us
     if bucket_count > MAX_METRIC_BUCKETS:
         raise ValueError(
@@ -301,10 +335,15 @@ def event_metrics(
         ) // timedelta(microseconds=1)
         return max(delta_us // width_us, 0)
 
+    def _boundary_iso(offset_us: int) -> str:
+        # 桶边界一律按整数微秒宽度从 start_dt 推进，与归桶宽度严格一致
+        return (start_dt + timedelta(microseconds=offset_us)).isoformat()
+
+    width_seconds = width_us / 1_000_000
     buckets: list[dict] = [
         {
-            "bucket_start": _iso(start_ts + i * bucket_seconds),
-            "bucket_end": _iso(min(start_ts + (i + 1) * bucket_seconds, end_ts)),
+            "bucket_start": _boundary_iso(i * width_us),
+            "bucket_end": _boundary_iso(min((i + 1) * width_us, span_us)),
             "severity_counts": {level: 0 for level in sev.LEVELS},
             "event_count": 0,
             "distinct_segment_count": 0,
@@ -336,7 +375,7 @@ def event_metrics(
         "source": source,
         "start_at": _iso(start_ts),
         "end_at": _iso(end_ts),
-        "bucket_seconds": float(bucket_seconds),
+        "bucket_seconds": width_seconds,
         "buckets": buckets,
     }
 
